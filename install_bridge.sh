@@ -193,12 +193,12 @@ create_config() {
             {
                 "type": "field",
                 "inboundTag": ["bridge"],
+                "domain": ["full:reverse.internal"],
                 "outboundTag": "tunnel"
             },
             {
                 "type": "field",
                 "inboundTag": ["bridge"],
-                "domain": ["full:reverse.internal"],
                 "outboundTag": "direct"
             }
         ]
@@ -244,8 +244,11 @@ start_container() {
     
     sleep 3
     
-    if docker compose ps | grep -q "running"; then
+    # Check if container is running
+    if docker ps --format '{{.Names}}' | grep -q "xray-bridge"; then
         echo -e "${GREEN}✓ Xray container is running${NC}"
+        echo -e "${CYAN}Recent logs:${NC}"
+        docker compose logs --tail=5
     else
         echo -e "${RED}✗ Container failed to start. Check logs:${NC}"
         docker compose logs --tail=20

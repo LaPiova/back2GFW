@@ -94,16 +94,18 @@ generate_credentials() {
     echo -e "${CYAN}Xray x25519 output:${NC}"
     echo "$KEYS_OUTPUT"
     
-    # Parse the keys - handle different output formats
-    # Format could be "Private key: xxx" or just two lines of keys
-    if echo "$KEYS_OUTPUT" | grep -q "Private key:"; then
-        PRIVATE_KEY=$(echo "$KEYS_OUTPUT" | grep -i "private" | awk -F': ' '{print $2}' | tr -d '[:space:]')
-        PUBLIC_KEY=$(echo "$KEYS_OUTPUT" | grep -i "public" | awk -F': ' '{print $2}' | tr -d '[:space:]')
-    else
-        # Fallback: assume first line is private, second is public
-        PRIVATE_KEY=$(echo "$KEYS_OUTPUT" | head -1 | tr -d '[:space:]')
-        PUBLIC_KEY=$(echo "$KEYS_OUTPUT" | tail -1 | tr -d '[:space:]')
-    fi
+    # Parse the keys - handle multiple output formats:
+    # Format 1: "Private key: xxxxx" (with space)
+    # Format 2: "PrivateKey:xxxxx" (no space, CamelCase)
+    # We need to extract just the key value (after the colon)
+    
+    # Use sed to remove everything up to and including the last colon and any spaces
+    PRIVATE_KEY=$(echo "$KEYS_OUTPUT" | grep -i "private" | sed 's/^[^:]*://' | tr -d '[:space:]')
+    PUBLIC_KEY=$(echo "$KEYS_OUTPUT" | grep -i "public" | sed 's/^[^:]*://' | tr -d '[:space:]')
+    
+    # Debug output
+    echo -e "${CYAN}Parsed Private Key: [${PRIVATE_KEY}]${NC}"
+    echo -e "${CYAN}Parsed Public Key: [${PUBLIC_KEY}]${NC}"
     
     # Validate keys are not empty
     if [[ -z "$PRIVATE_KEY" ]] || [[ -z "$PUBLIC_KEY" ]]; then
@@ -112,12 +114,17 @@ generate_credentials() {
         exit 1
     fi
     
+    # Validate keys don't still contain colon (prefix leak)
+    if [[ "$PRIVATE_KEY" == *":"* ]] || [[ "$PRIVATE_KEY" == *"Private"* ]] || [[ "$PRIVATE_KEY" == *"Key"* ]]; then
+        echo -e "${RED}✗ Key parsing error - extracted key still contains prefix${NC}"
+        echo -e "${RED}Private key was: $PRIVATE_KEY${NC}"
+        exit 1
+    fi
+    
     # Generate ShortId (8 hex characters)
     SHORT_ID=$(openssl rand -hex 4)
     
     echo -e "${GREEN}✓ Credentials generated${NC}"
-    echo -e "  Private Key: ${PRIVATE_KEY:0:20}..."
-    echo -e "  Public Key:  ${PUBLIC_KEY:0:20}..."
 }
 
 #######################################
@@ -256,14 +263,15 @@ start_container() {
     
     sleep 3
     
-    if docker compose ps | grep -q "running"; then
+    # Check if container is running
+    if docker ps --format '{{.Names}}' | grep -q "xray-portal"; then
         echo -e "${GREEN}✓ Xray container is running${NC}"
+        echo -e "${CYAN}Recent logs:${NC}"
+        docker compose logs --tail=5
     else
-        echo -e "${RED}✗ Container may have issues. Checking logs:${NC}"
+        echo -e "${RED}✗ Container failed to start. Check logs:${NC}"
         docker compose logs --tail=20
-        echo ""
-        echo -e "${YELLOW}Container status:${NC}"
-        docker compose ps
+        exit 1
     fi
 }
 
