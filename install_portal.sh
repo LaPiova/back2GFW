@@ -23,8 +23,8 @@ NC='\033[0m' # No Color
 
 # Configuration
 INSTALL_DIR="/opt/xray-portal"
-REALITY_DEST="www.microsoft.com:443"  # SNI target for REALITY
-REALITY_SERVER_NAMES="www.microsoft.com,microsoft.com"
+REALITY_DEST="www.microsoft.com:443"
+REALITY_SERVER_NAMES='["www.microsoft.com","microsoft.com"]'
 
 echo -e "${CYAN}"
 echo "╔══════════════════════════════════════════════════════════════╗"
@@ -63,9 +63,17 @@ install_docker_compose() {
     fi
     
     echo -e "${YELLOW}Installing Docker Compose plugin...${NC}"
-    apt-get update -qq
-    apt-get install -y docker-compose-plugin
-    echo -e "${GREEN}✓ Docker Compose installed successfully${NC}"
+    # Try multiple methods
+    if apt-get update -qq && apt-get install -y docker-compose-plugin 2>/dev/null; then
+        echo -e "${GREEN}✓ Docker Compose installed via apt${NC}"
+    else
+        echo -e "${YELLOW}Installing Docker Compose standalone...${NC}"
+        COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")')
+        curl -L "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+        chmod +x /usr/local/bin/docker-compose
+        ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+        echo -e "${GREEN}✓ Docker Compose installed standalone${NC}"
+    fi
 }
 
 #######################################
@@ -80,14 +88,36 @@ generate_credentials() {
     
     # Generate REALITY x25519 keypair using xray binary in Docker
     echo -e "${YELLOW}Generating REALITY x25519 keypair...${NC}"
-    KEYS=$(docker run --rm ghcr.io/xtls/xray-core x25519)
-    PRIVATE_KEY=$(echo "$KEYS" | grep "Private key:" | awk '{print $3}')
-    PUBLIC_KEY=$(echo "$KEYS" | grep "Public key:" | awk '{print $3}')
+    
+    # Get the raw output first
+    KEYS_OUTPUT=$(docker run --rm ghcr.io/xtls/xray-core x25519 2>&1)
+    echo -e "${CYAN}Xray x25519 output:${NC}"
+    echo "$KEYS_OUTPUT"
+    
+    # Parse the keys - handle different output formats
+    # Format could be "Private key: xxx" or just two lines of keys
+    if echo "$KEYS_OUTPUT" | grep -q "Private key:"; then
+        PRIVATE_KEY=$(echo "$KEYS_OUTPUT" | grep -i "private" | awk -F': ' '{print $2}' | tr -d '[:space:]')
+        PUBLIC_KEY=$(echo "$KEYS_OUTPUT" | grep -i "public" | awk -F': ' '{print $2}' | tr -d '[:space:]')
+    else
+        # Fallback: assume first line is private, second is public
+        PRIVATE_KEY=$(echo "$KEYS_OUTPUT" | head -1 | tr -d '[:space:]')
+        PUBLIC_KEY=$(echo "$KEYS_OUTPUT" | tail -1 | tr -d '[:space:]')
+    fi
+    
+    # Validate keys are not empty
+    if [[ -z "$PRIVATE_KEY" ]] || [[ -z "$PUBLIC_KEY" ]]; then
+        echo -e "${RED}✗ Failed to generate x25519 keys${NC}"
+        echo -e "${RED}Raw output was: $KEYS_OUTPUT${NC}"
+        exit 1
+    fi
     
     # Generate ShortId (8 hex characters)
     SHORT_ID=$(openssl rand -hex 4)
     
     echo -e "${GREEN}✓ Credentials generated${NC}"
+    echo -e "  Private Key: ${PRIVATE_KEY:0:20}..."
+    echo -e "  Public Key:  ${PUBLIC_KEY:0:20}..."
 }
 
 #######################################
@@ -98,30 +128,15 @@ create_config() {
     
     mkdir -p "$INSTALL_DIR"
     
-    cat > "$INSTALL_DIR/config.json" << EOF
+    # Create config without comments (pure JSON)
+    cat > "$INSTALL_DIR/config.json" << EOFCONFIG
 {
-    // ============================================================
-    // Xray Portal Configuration (Overseas Node)
-    // ============================================================
-    // This node acts as:
-    //   1. Entry point for users (VLESS + REALITY)
-    //   2. Rendezvous point for the Bridge (gRPC)
-    //   3. Traffic router via reverse proxy
-    // ============================================================
-    
     "log": {
         "loglevel": "warning",
         "access": "/var/log/xray/access.log",
         "error": "/var/log/xray/error.log"
     },
-    
     "inbounds": [
-        // ----------------------------------------------------
-        // Inbound 1: User-facing (VLESS + Vision + REALITY)
-        // - Port 443 for stealth (looks like HTTPS)
-        // - REALITY eliminates the need for certificates
-        // - Vision flow for performance
-        // ----------------------------------------------------
         {
             "tag": "inbound-user",
             "port": 443,
@@ -140,7 +155,7 @@ create_config() {
                 "security": "reality",
                 "realitySettings": {
                     "dest": "${REALITY_DEST}",
-                    "serverNames": [${REALITY_SERVER_NAMES//,/\",\"}],
+                    "serverNames": ${REALITY_SERVER_NAMES},
                     "privateKey": "${PRIVATE_KEY}",
                     "shortIds": ["${SHORT_ID}"]
                 }
@@ -150,13 +165,6 @@ create_config() {
                 "destOverride": ["http", "tls"]
             }
         },
-        
-        // ----------------------------------------------------
-        // Inbound 2: Bridge connection (gRPC tunnel receiver)
-        // - Port 8443 for internal tunnel
-        // - Bridge connects here with its UUID
-        // - This is the "tunnel endpoint" side of the portal
-        // ----------------------------------------------------
         {
             "tag": "inbound-bridge",
             "port": 8443,
@@ -178,12 +186,6 @@ create_config() {
             }
         }
     ],
-    
-    // ============================================================
-    // Reverse Proxy: Portal Definition
-    // - tag: identifies this portal
-    // - domain: virtual domain for routing (must match bridge)
-    // ============================================================
     "reverse": {
         "portals": [
             {
@@ -192,44 +194,24 @@ create_config() {
             }
         ]
     },
-    
     "outbounds": [
-        // ----------------------------------------------------
-        // Outbound 1: Freedom (direct exit - not used normally)
-        // ----------------------------------------------------
         {
             "tag": "direct",
             "protocol": "freedom"
         },
-        
-        // ----------------------------------------------------
-        // Outbound 2: Blackhole (block unwanted traffic)
-        // ----------------------------------------------------
         {
             "tag": "blocked",
             "protocol": "blackhole"
         }
     ],
-    
-    // ============================================================
-    // Routing Rules
-    // - User traffic -> Portal -> (tunneled to Bridge)
-    // - Bridge tunnel traffic handled by reverse module
-    // ============================================================
     "routing": {
         "domainStrategy": "AsIs",
         "rules": [
-            // Rule 1: Route user inbound to the portal (reverse tunnel)
-            // This is the KEY rule: user traffic enters via inbound-user
-            // and exits through the portal which tunnels it to the bridge
             {
                 "type": "field",
                 "inboundTag": ["inbound-user"],
                 "outboundTag": "portal"
             },
-            
-            // Rule 2: Handle the bridge's tunnel connection
-            // Traffic from the bridge establishes the reverse tunnel
             {
                 "type": "field",
                 "inboundTag": ["inbound-bridge"],
@@ -238,11 +220,8 @@ create_config() {
         ]
     }
 }
-EOF
+EOFCONFIG
 
-    # Remove JSON comments (Xray supports them, but let's be safe)
-    # Actually, Xray-core DOES support // comments natively, so we keep them
-    
     echo -e "${GREEN}✓ Configuration created at $INSTALL_DIR/config.json${NC}"
 }
 
@@ -282,14 +261,16 @@ start_container() {
     docker compose down 2>/dev/null || true
     docker compose up -d
     
-    sleep 2
+    sleep 3
     
     if docker compose ps | grep -q "running"; then
         echo -e "${GREEN}✓ Xray container is running${NC}"
     else
-        echo -e "${RED}✗ Container failed to start. Check logs:${NC}"
-        docker compose logs
-        exit 1
+        echo -e "${RED}✗ Container may have issues. Checking logs:${NC}"
+        docker compose logs --tail=20
+        echo ""
+        echo -e "${YELLOW}Container status:${NC}"
+        docker compose ps
     fi
 }
 
@@ -298,7 +279,7 @@ start_container() {
 #######################################
 display_credentials() {
     # Get server IP
-    SERVER_IP=$(curl -s4 ifconfig.me || curl -s4 icanhazip.com || echo "YOUR_SERVER_IP")
+    SERVER_IP=$(curl -s4 ifconfig.me 2>/dev/null || curl -s4 icanhazip.com 2>/dev/null || echo "YOUR_SERVER_IP")
     
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
@@ -339,7 +320,7 @@ display_credentials() {
     echo ""
     
     # Save credentials to file
-    cat > "$INSTALL_DIR/credentials.txt" << EOF
+    cat > "$INSTALL_DIR/credentials.txt" << EOFCREDS
 === Xray Portal Credentials ===
 Generated: $(date)
 
@@ -364,7 +345,7 @@ ${VLESS_LINK}
 PORTAL_IP="${SERVER_IP}"
 PORTAL_GRPC_PORT="8443"
 BRIDGE_UUID="${BRIDGE_UUID}"
-EOF
+EOFCREDS
 
     echo -e "${CYAN}Credentials saved to: ${INSTALL_DIR}/credentials.txt${NC}"
     echo ""
