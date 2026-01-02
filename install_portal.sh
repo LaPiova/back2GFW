@@ -132,9 +132,7 @@ create_config() {
     cat > "$INSTALL_DIR/config.json" << EOFCONFIG
 {
     "log": {
-        "loglevel": "warning",
-        "access": "/var/log/xray/access.log",
-        "error": "/var/log/xray/error.log"
+        "loglevel": "warning"
     },
     "inbounds": [
         {
@@ -232,8 +230,6 @@ create_docker_compose() {
     echo -e "${YELLOW}Creating Docker Compose file...${NC}"
     
     cat > "$INSTALL_DIR/docker-compose.yml" << 'EOF'
-version: "3.8"
-
 services:
   xray:
     image: ghcr.io/xtls/xray-core:latest
@@ -242,12 +238,9 @@ services:
     network_mode: host
     volumes:
       - ./config.json:/etc/xray/config.json:ro
-      - ./logs:/var/log/xray
     command: ["run", "-c", "/etc/xray/config.json"]
 EOF
 
-    mkdir -p "$INSTALL_DIR/logs"
-    
     echo -e "${GREEN}✓ Docker Compose file created${NC}"
 }
 

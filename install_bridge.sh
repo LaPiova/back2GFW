@@ -69,9 +69,16 @@ install_docker_compose() {
     fi
     
     echo -e "${YELLOW}Installing Docker Compose plugin...${NC}"
-    apt-get update -qq
-    apt-get install -y docker-compose-plugin
-    echo -e "${GREEN}✓ Docker Compose installed successfully${NC}"
+    if apt-get update -qq && apt-get install -y docker-compose-plugin 2>/dev/null; then
+        echo -e "${GREEN}✓ Docker Compose installed via apt${NC}"
+    else
+        echo -e "${YELLOW}Installing Docker Compose standalone...${NC}"
+        COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")')
+        curl -L "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+        chmod +x /usr/local/bin/docker-compose
+        ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+        echo -e "${GREEN}✓ Docker Compose installed standalone${NC}"
+    fi
 }
 
 #######################################
@@ -127,34 +134,13 @@ create_config() {
     
     mkdir -p "$INSTALL_DIR"
     
-    cat > "$INSTALL_DIR/config.json" << EOF
+    # Create config without file logging (use console only to avoid permission issues)
+    cat > "$INSTALL_DIR/config.json" << EOFCONFIG
 {
-    // ============================================================
-    // Xray Bridge Configuration (Domestic China Node)
-    // ============================================================
-    // This node acts as:
-    //   1. Outbound-only client (ZERO inbound ports)
-    //   2. Reverse bridge - tunnels back to Portal
-    //   3. Exit point for traffic to China destinations
-    // ============================================================
-    
     "log": {
-        "loglevel": "warning",
-        "access": "/var/log/xray/access.log",
-        "error": "/var/log/xray/error.log"
+        "loglevel": "warning"
     },
-    
-    // ============================================================
-    // NO INBOUNDS - This is the stealth feature!
-    // The bridge only makes OUTBOUND connections
-    // ============================================================
     "inbounds": [],
-    
-    // ============================================================
-    // Reverse Proxy: Bridge Definition
-    // - tag: identifies this bridge (routes traffic here)
-    // - domain: virtual domain for routing (must match portal)
-    // ============================================================
     "reverse": {
         "bridges": [
             {
@@ -163,13 +149,7 @@ create_config() {
             }
         ]
     },
-    
     "outbounds": [
-        // ----------------------------------------------------
-        // Outbound 1: Tunnel to Portal (gRPC)
-        // This establishes the reverse tunnel connection
-        // Bridge -> Portal via gRPC, persistent connection
-        // ----------------------------------------------------
         {
             "tag": "tunnel",
             "protocol": "vless",
@@ -195,11 +175,6 @@ create_config() {
                 "security": "none"
             }
         },
-        
-        // ----------------------------------------------------
-        // Outbound 2: Freedom (direct exit to China internet)
-        // This is where user traffic actually exits
-        // ----------------------------------------------------
         {
             "tag": "direct",
             "protocol": "freedom",
@@ -207,34 +182,19 @@ create_config() {
                 "domainStrategy": "UseIPv4"
             }
         },
-        
-        // ----------------------------------------------------
-        // Outbound 3: Blackhole (block unwanted traffic)
-        // ----------------------------------------------------
         {
             "tag": "blocked",
             "protocol": "blackhole"
         }
     ],
-    
-    // ============================================================
-    // Routing Rules
-    // - Bridge tunnel traffic -> tunnel outbound (to Portal)
-    // - User traffic (from tunnel) -> direct (to China sites)
-    // ============================================================
     "routing": {
         "domainStrategy": "AsIs",
         "rules": [
-            // Rule 1: Tunnel establishment traffic
-            // The bridge communicates with portal via tunnel outbound
             {
                 "type": "field",
                 "inboundTag": ["bridge"],
                 "outboundTag": "tunnel"
             },
-            
-            // Rule 2: User traffic exits directly to China
-            // Traffic that comes through the reverse tunnel exits here
             {
                 "type": "field",
                 "inboundTag": ["bridge"],
@@ -244,7 +204,7 @@ create_config() {
         ]
     }
 }
-EOF
+EOFCONFIG
 
     echo -e "${GREEN}✓ Configuration created at $INSTALL_DIR/config.json${NC}"
 }
@@ -256,26 +216,19 @@ create_docker_compose() {
     echo -e "${YELLOW}Creating Docker Compose file...${NC}"
     
     cat > "$INSTALL_DIR/docker-compose.yml" << 'EOF'
-version: "3.8"
-
 services:
   xray:
     image: ghcr.io/xtls/xray-core:latest
     container_name: xray-bridge
     restart: always
-    # NOTE: No port mappings! This is outbound-only
     volumes:
       - ./config.json:/etc/xray/config.json:ro
-      - ./logs:/var/log/xray
     command: ["run", "-c", "/etc/xray/config.json"]
-    # DNS for China (use Aliyun DNS)
     dns:
       - 223.5.5.5
       - 223.6.6.6
 EOF
 
-    mkdir -p "$INSTALL_DIR/logs"
-    
     echo -e "${GREEN}✓ Docker Compose file created${NC}"
 }
 
@@ -295,7 +248,7 @@ start_container() {
         echo -e "${GREEN}✓ Xray container is running${NC}"
     else
         echo -e "${RED}✗ Container failed to start. Check logs:${NC}"
-        docker compose logs
+        docker compose logs --tail=20
         exit 1
     fi
 }
@@ -350,7 +303,7 @@ display_status() {
     echo ""
     
     # Save config info
-    cat > "$INSTALL_DIR/connection_info.txt" << EOF
+    cat > "$INSTALL_DIR/connection_info.txt" << EOFINFO
 === Xray Bridge Connection Info ===
 Generated: $(date)
 
@@ -360,7 +313,7 @@ Inbound Ports:  NONE (stealth mode)
 
 Traffic Flow:
 Client -> Portal (${PORTAL_IP}:443) -> Bridge -> China Destinations
-EOF
+EOFINFO
 
     echo -e "${CYAN}Connection info saved to: ${INSTALL_DIR}/connection_info.txt${NC}"
     echo ""
